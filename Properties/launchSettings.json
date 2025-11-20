@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "file_upload_poc": {
+      "commandName": "Project",
+      "commandLineArgs": "--port 7259",
+      "launchBrowser": false
+    }
+  }
+}
