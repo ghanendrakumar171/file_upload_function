@@ -2,6 +2,7 @@ using System;
 using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Azure.Data.Tables;
 using Azure.Messaging.EventGrid;
 using Azure.Storage.Blobs;
 using Microsoft.Azure.Functions.Worker;
@@ -13,6 +14,7 @@ namespace AIExploration.FileScan.Functions
     {
         private readonly ILogger _logger;
         private readonly BlobServiceClient _blobServiceClient;
+        private readonly TableClient _tableClient;
 
         private readonly string quarantineContainer = "quarantine";
         private readonly string cleanContainer = "clean";
@@ -20,20 +22,33 @@ namespace AIExploration.FileScan.Functions
 
         public FileScanEventHandler(
             ILoggerFactory loggerFactory,
-            BlobServiceClient blobServiceClient)
+            BlobServiceClient blobServiceClient,
+            TableClient tableClient)
         {
             _logger = loggerFactory.CreateLogger<FileScanEventHandler>();
             _blobServiceClient = blobServiceClient;
+            _tableClient = tableClient;
+
+            // ---------------------------------------------------
+            // 🔍 CHECK TABLE ACCESS / CONNECTIVITY ON STARTUP
+            // ---------------------------------------------------
+            try
+            {
+                _tableClient.CreateIfNotExists();
+                _logger.LogInformation("✔ Connected to Azure Table Storage. Using table: {TableName}", _tableClient.Name);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Could not access Azure Table Storage. Reason: {Message}", ex.Message);
+            }
         }
 
         [Function("FileScanEventHandler")]
         public async Task RunAsync([EventGridTrigger] EventGridEvent eventGridEvent)
         {
             string eventType = eventGridEvent.EventType;
-
             _logger.LogInformation("📩 Event Triggered ➝ {EventType}", eventType);
 
-            // Dump RAW JSON
             string rawJson = eventGridEvent.Data.ToString();
             _logger.LogInformation("===== RAW EVENT JSON START =====");
             _logger.LogInformation(rawJson);
@@ -42,15 +57,14 @@ namespace AIExploration.FileScan.Functions
             using var doc = JsonDocument.Parse(rawJson);
             var root = doc.RootElement;
 
-            // ========================================================
-            // 1️⃣ HANDLE BLOB CREATED → WAIT FOR SCAN RESULT
-            // ========================================================
+            // -----------------------------------------------------------
+            // 1️⃣ BLOB CREATED → Insert Pending Table Entry
+            // -----------------------------------------------------------
             if (eventType == "Microsoft.Storage.BlobCreated")
             {
-                // Only process quarantine uploads
                 if (!eventGridEvent.Subject.Contains($"/containers/{quarantineContainer}/"))
                 {
-                    _logger.LogWarning("⏭ Skipping non-quarantine BlobCreated event.");
+                    _logger.LogWarning("⏭ Skipping non-quarantine upload event");
                     return;
                 }
 
@@ -58,21 +72,39 @@ namespace AIExploration.FileScan.Functions
                 _logger.LogInformation("🔗 Blob URL: {BlobUrl}", blobUrl);
 
                 var uri = new Uri(blobUrl);
-
                 string blobPath = Uri.UnescapeDataString(string.Join("", uri.Segments.Skip(2)));
-                _logger.LogInformation("📁 Quarantine Blob Path: {BlobPath}", blobPath);
+                _logger.LogInformation("📁 Blob Path: {BlobPath}", blobPath);
 
-                _logger.LogInformation("🕒 File uploaded → waiting for Defender scan...");
+                var parts = blobPath.Split('/', 2);
+                string fileId = parts[0];
+                string fileName = parts.Length > 1 ? parts[1] : "unknown";
+
+                _logger.LogInformation("🆔 fileId: {fileId}", fileId);
+
+                // Create Pending Table Entry
+                var entity = new TableEntity("Files", fileId)
+                {
+                    { "FileId", fileId },
+                    { "FileName", fileName },
+                    { "BlobPath", blobPath },
+                    { "Container", quarantineContainer },
+                    { "ScanStatus", "Pending" },
+                    { "Message", "Waiting for Defender scan" },
+                    { "CreatedAt", DateTime.UtcNow }
+                };
+
+                await _tableClient.UpsertEntityAsync(entity);
+                _logger.LogInformation("✔ Table entry created for fileId={FileId}", fileId);
+
                 return;
             }
 
-
-            // ========================================================
-            // 2️⃣ HANDLE DEFENDER SCAN RESULT EVENT
-            // ========================================================
+            // -----------------------------------------------------------
+            // 2️⃣ DEFENDER RESULT → Update Table + Move Blob
+            // -----------------------------------------------------------
             if (eventType == "Microsoft.Security.MalwareScanningResult")
             {
-                _logger.LogInformation("🛡 Defender Scan Result Event Received");
+                _logger.LogInformation("🛡 Defender Scan Result Received");
 
                 string blobUri = root.GetProperty("blobUri").GetString();
                 string scanResult = root.GetProperty("scanResultType").GetString();
@@ -80,60 +112,72 @@ namespace AIExploration.FileScan.Functions
                 _logger.LogInformation("🔗 Blob URI: {BlobUri}", blobUri);
                 _logger.LogInformation("🧪 Scan Result: {ScanResult}", scanResult);
 
-                // ❗ Skip duplicate events where blob already moved
                 if (!blobUri.Contains($"/{quarantineContainer}/"))
                 {
-                    _logger.LogWarning("⏭ Skipping Defender event — blob is no longer in quarantine.");
+                    _logger.LogWarning("⏭ Blob not found in quarantine — skipping");
                     return;
                 }
 
-                // Decode path
                 var uri = new Uri(blobUri);
                 string blobPath = Uri.UnescapeDataString(string.Join("", uri.Segments.Skip(2)));
+                _logger.LogInformation("📁 Decoded Path: {BlobPath}", blobPath);
 
-                _logger.LogInformation("📁 Decoded Blob Path: {BlobPath}", blobPath);
+                var parts = blobPath.Split('/', 2);
+                string fileId = parts[0];
+                string fileName = parts.Length > 1 ? parts[1] : "unknown";
 
-                // Decide clean / malicious
                 bool isMalicious =
-                    scanResult.Equals("Malicious", StringComparison.OrdinalIgnoreCase) ||
-                    scanResult.Equals("ThreatDetected", StringComparison.OrdinalIgnoreCase);
+                    scanResult.Contains("Malicious", StringComparison.OrdinalIgnoreCase) ||
+                    scanResult.Contains("Threat available", StringComparison.OrdinalIgnoreCase);
 
                 string destination = isMalicious ? maliciousContainer : cleanContainer;
+                string finalStatus = isMalicious ? "Malicious" : "Clean";
 
-                _logger.LogInformation("🎯 Final Decision: Moving → {Destination}", destination);
+                _logger.LogInformation("🎯 Final Status = {FinalStatus}, Destination = {Destination}", finalStatus, destination);
 
+                // Move Blob
                 await MoveBlobAsync(blobPath, quarantineContainer, destination);
+
+                // Update Table Entry
+                var updatedEntity = new TableEntity("Files", fileId)
+                {
+                    { "FileId", fileId },
+                    { "FileName", fileName },
+                    { "BlobPath", blobPath },
+                    { "Container", destination },
+                    { "ScanStatus", finalStatus },
+                    { "Message", scanResult },
+                    { "UpdatedAt", DateTime.UtcNow }
+                };
+
+                await _tableClient.UpsertEntityAsync(updatedEntity);
+                _logger.LogInformation("✔ Table updated for fileId={FileId}", fileId);
 
                 return;
             }
 
-
-            // ========================================================
-            // 3️⃣ IGNORE ALL OTHER EVENTS
-            // ========================================================
             _logger.LogWarning("⏭ Skipping unsupported event type: {EventType}", eventType);
         }
 
-
-        // ========================================================
-        // MOVE BLOB FUNCTION (COPY + DELETE)
-        // ========================================================
+        // -----------------------------------------------------------
+        // COPY + DELETE (Move Blob)
+        // -----------------------------------------------------------
         private async Task MoveBlobAsync(string blobPath, string from, string to)
         {
             var source = _blobServiceClient.GetBlobContainerClient(from);
-            var destination = _blobServiceClient.GetBlobContainerClient(to);
+            var dest = _blobServiceClient.GetBlobContainerClient(to);
 
-            await destination.CreateIfNotExistsAsync();
+            await dest.CreateIfNotExistsAsync();
 
-            var sourceBlob = source.GetBlobClient(blobPath);
-            var destBlob = destination.GetBlobClient(blobPath);
+            var srcBlob = source.GetBlobClient(blobPath);
+            var destBlob = dest.GetBlobClient(blobPath);
 
-            _logger.LogInformation("📦 Copying from {From} ➝ {To}", from, to);
+            _logger.LogInformation("📦 Moving blob from {From} → {To}", from, to);
 
-            await destBlob.StartCopyFromUriAsync(sourceBlob.Uri);
-            await sourceBlob.DeleteIfExistsAsync();
+            await destBlob.StartCopyFromUriAsync(srcBlob.Uri);
+            await srcBlob.DeleteIfExistsAsync();
 
-            _logger.LogInformation("🆗 Move complete");
+            _logger.LogInformation("🆗 Blob move completed");
         }
     }
 }
